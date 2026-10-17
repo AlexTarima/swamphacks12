@@ -6,11 +6,12 @@ import math
 
 import database
 import ml_risk
+import freshness
 from risk_sources import RiskSources, distance_km, http_client, parse_time, utcnow
 from refresh_locks import lease
 
 METHOD_VERSION = "planning-screen-v2"
-ASSESSMENT_REVISION = 2
+ASSESSMENT_REVISION = 5
 LEVELS = {"unknown": -1, "info": -1, "low": 0, "watch": 1, "high": 2, "severe": 3}
 ALERT_TERMS = {
     "weather": ("wind", "tornado", "hurricane", "tropical", "storm", "snow", "blizzard", "ice"),
@@ -249,12 +250,11 @@ def assess(site, sources):
 
 
 def snapshot_is_fresh(snapshot, site):
-    ttl = 300 if snapshot and snapshot["overall"]["coverage_complete"] else 60
     return (snapshot is not None and snapshot.get("method_version") == METHOD_VERSION
             and snapshot.get("assessment_revision") == ASSESSMENT_REVISION
             and snapshot.get("ml_configuration_id") == ml_risk.configuration_id()
             and snapshot.get("site") == site
-            and timedelta(0) <= utcnow() - parse_time(snapshot["generated_at"]) < timedelta(seconds=ttl))
+            and not freshness.assessment(snapshot, now=utcnow())['stale'])
 
 
 async def refresh_site(site, sources):
@@ -264,10 +264,22 @@ async def refresh_site(site, sources):
 
 
 async def refresh_site_locked(site, sources):
+    import alerts, briefings, rivers
     snapshot = database.load_risk(site["id"])
-    if snapshot_is_fresh(snapshot, site):
+    if snapshot_is_fresh(snapshot, site) and not freshness.assessment(snapshot, now=utcnow())['refresh_due']:
+        alerts.evaluate(snapshot, include_lightning=False)
         return {**snapshot, "cached": True, "stale": False}
     result = assess(site, await sources.for_site(site))
+    zone = (result.get("weather") or {}).get("timezone")
+    if zone:
+        briefings.set_timezone(site["id"], zone, source="weather")
+    # Emit newly dangerous direct weather/NWS rules immediately, without clearing
+    # existing river episodes until the combined flood evidence is evaluated.
+    alerts.evaluate(result, include_lightning=False, allow_resolution=False)
+    result = await rivers.augment_assessment(site, result, sources.client)
+    # Notify rule-based safety actions before waiting on the optional ML service.
+    alerts.evaluate(result, include_lightning=False)
+    result['ml_context'] = ml_risk.capture_context(result)
     result["ml_assessment"] = await ml_risk.predict(result)
     result["ml_configuration_id"] = ml_risk.configuration_id()
     result = database.save_refreshed_risk(site["id"], result)
@@ -286,26 +298,5 @@ async def refresh_many(sites):
 
 
 def risk_overview(sites):
-    import lightning
-    result = []
-    for site in sites:
-        snapshot = database.load_risk(site["id"])
-        # Old snapshots mixed present and future and must not masquerade as current.
-        if snapshot and (snapshot.get("method_version") != METHOD_VERSION
-                         or snapshot.get("assessment_revision") != ASSESSMENT_REVISION):
-            snapshot = None
-        result.append({
-            "site": site, "status": "ready" if snapshot else "pending",
-            "stale": not snapshot_is_fresh(snapshot, site),
-            "generated_at": snapshot["generated_at"] if snapshot else None,
-            "overall": snapshot["current_risk"]["overall"] if snapshot else None,
-            "current_risk": snapshot["current_risk"]["overall"] if snapshot else None,
-            "highest_upcoming_risk": ({"time": snapshot["highest_upcoming_risk"]["time"],
-                                       **snapshot["highest_upcoming_risk"]["overall"]} if snapshot else None),
-            "ml_assessment": ({key: value for key, value in snapshot.get("ml_assessment", {}).items()
-                               if key != "hourly_scores"} if snapshot else None),
-            "risk_url": f"/api/sites/{site['id']}/risk",
-            "lightning_monitor": lightning.saved(site["id"]),
-            "sources": snapshot.get("sources") if snapshot else None,
-        })
-    return {"count": len(result), "sites": result}
+    import site_responses
+    return site_responses.overview(sites)

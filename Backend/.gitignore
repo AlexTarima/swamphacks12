@@ -6,3 +6,6 @@ __pycache__/
 .cache/
 .venv
 .env
+.venv-wsl/
+data/uploads/
+data/runtime/

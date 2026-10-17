@@ -1,13 +1,25 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from fastapi import Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, field_validator
+import os
+import secrets
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import database
 import risk
 import lightning
 import refresh_jobs
+import alerts
+import notifications
+import crew_reports
+import briefings
+import rivers
+import hefs
+import strike_feed
+import ml_risk
+import site_responses
 from refresh_locks import RefreshBusy
 from weather import request_params, weather_response
 
@@ -25,26 +37,47 @@ async def lifespan(app: FastAPI):
         await scheduler.stop()
 
 
-app = FastAPI(title="PlanIT Control Backend", lifespan=lifespan)
+app = FastAPI(title="PlanIT Control Backend", version="0.3.0", lifespan=lifespan)
+for router in (alerts.router, notifications.router, crew_reports.router, briefings.router, rivers.router, hefs.router, strike_feed.router):
+    app.include_router(router)
+
+
+@app.middleware("http")
+async def protect_writes(request: Request, call_next):
+    token = os.environ.get("PLANIT_WRITE_TOKEN")
+    if token and request.method not in ("GET", "HEAD", "OPTIONS"):
+        if not secrets.compare_digest(request.headers.get("authorization", ""), "Bearer " + token):
+            return JSONResponse({"detail": "A valid write token is required"}, status_code=401)
+    return await call_next(request)
 
 # Allow a locally running Vite frontend to call this backend.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
+    allow_origins=list(dict.fromkeys([
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-    ],
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+        *[value.strip().rstrip('/') for value in os.environ.get("PLANIT_ALLOWED_ORIGINS", "").split(',') if value.strip()],
+    ])),
+    allow_methods=["GET", "POST", "PUT"],
+    allow_headers=["Content-Type", "Authorization", "Last-Event-ID"],
 )
 
 # defines and validates the input.
 # Name must contain a non-whitespace character, latitude/longitude
 # are valid
 class SiteCreate(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     name: str = Field(min_length=1, pattern=r"\S")
     latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
+    timezone: str | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def valid_timezone(cls, value):
+        if value is not None:
+            briefings._zone(value)
+        return value
 
 # defines response.
 class Site(SiteCreate):
@@ -66,17 +99,19 @@ def health():
 
 @app.get("/api/sites", response_model=list[Site])
 def get_sites():
-    return database.list_sites()
+    return [{**site, "timezone": briefings.get_timezone(site["id"])} for site in database.list_sites()]
 
 # Third End Point. Front end will send a json with name, latitude,
 # and longitude.
 # The database assigns an ID and commits the site to disk.
 @app.post("/api/sites", response_model=Site, status_code=201)
 def create_site(site: SiteCreate):
-    return database.insert_site(**site.model_dump())
+    result = database.insert_site(**site.model_dump(exclude={"timezone"}))
+    if site.timezone:
+        briefings.set_timezone(result["id"], site.timezone)
+    return {**result, "timezone": site.timezone}
 
 # gets site_id from the url itself and then uses that in function
-@app.get("/api/sites/{site_id}", response_model=Site)
 def get_site(site_id: int):
     site = database.find_site(site_id)
     if site is None:
@@ -86,6 +121,11 @@ def get_site(site_id: int):
         )
 
     return site
+
+
+@app.get("/api/sites/{site_id}", response_model=Site)
+def get_site_record(site_id: int):
+    return {**get_site(site_id), "timezone": briefings.get_timezone(site_id)}
 # API for weather data
 def fetch_weather(latitude: float, longitude: float):
     url = "https://api.open-meteo.com/v1/forecast"
@@ -145,7 +185,32 @@ async def get_site_risk(site_id: int):
         result = await risk.get_site_risk(get_site(site_id))
     except RefreshBusy as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
-    return {**result, "lightning_monitor": lightning.saved(site_id)}
+    return site_responses.detail(database.find_site(site_id), result)
+
+
+@app.get("/api/sites/{site_id}/detail")
+def get_site_detail(site_id: int):
+    """Saved combined view; never waits for a provider or for the optional model."""
+    return site_responses.detail(get_site(site_id))
+
+
+@app.get("/api/sites/{site_id}/ml-input")
+async def get_model_input(site_id: int):
+    try:
+        assessment = await risk.get_site_risk(get_site(site_id))
+    except RefreshBusy as error:
+        raise HTTPException(409, str(error)) from error
+    return ml_risk.request_for(assessment)
+
+
+@app.post("/api/sites/{site_id}/ml-output")
+def submit_model_output(site_id: int, output: ml_risk.ModelOutput):
+    get_site(site_id)
+    try:
+        database.save_model_output(site_id, output.model_dump(mode="json"))
+        return ml_risk.serialize_predictions(database.load_risk(site_id))
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
 
 
 @app.get("/api/sites/{site_id}/lightning")

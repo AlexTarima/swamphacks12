@@ -8,6 +8,9 @@ import time
 import database
 import lightning
 import risk
+import strike_feed
+import briefings
+import hefs
 from refresh_locks import RefreshBusy, lease
 from risk_sources import RiskSources, http_client, parse_time, utcnow
 
@@ -18,6 +21,9 @@ def intervals():
     return {
         "full": max(10, float(os.environ.get("PLANIT_REFRESH_SECONDS", "300"))),
         "lightning": max(5, float(os.environ.get("PLANIT_LIGHTNING_SECONDS", "30"))),
+        "strikes": max(5, float(os.environ.get("PLANIT_STRIKE_SECONDS", "15"))),
+        "briefings": 30,
+        "hefs": max(900, float(os.environ.get("PLANIT_HEFS_SECONDS", "900"))),
     }
 
 
@@ -26,7 +32,7 @@ def enabled():
 
 
 async def run(kind="full", sites=None, trigger="manual", scheduled=False, interval=None):
-    if kind not in ("full", "lightning"):
+    if kind not in ("full", "lightning", "strikes", "briefings", "hefs"):
         raise ValueError("Unknown refresh job")
     async with lease("job:" + kind):
         latest = database.latest_run(kind)
@@ -36,11 +42,16 @@ async def run(kind="full", sites=None, trigger="manual", scheduled=False, interv
             if (utcnow() - parse_time(latest["finished_at"])).total_seconds() < delay:
                 return {"status": "not_due", "count": 0, "risks": []}
         # Re-read every run: newly created sites require no registration step.
-        sites = database.list_sites() if sites is None else sites
+        sites = (hefs.associated_sites() if kind == 'hefs' else database.list_sites()) if sites is None else sites
         run_id = database.start_run(kind, trigger, utcnow().isoformat(), len(sites))
         results, failures = [], []
         tasks = []
         try:
+            if kind == "briefings":
+                outcome = await briefings.tick()
+                status = "partial" if outcome["failures"] else "succeeded"
+                database.finish_run(run_id, utcnow().isoformat(), status, outcome["failures"])
+                return {"run_id": run_id, "status": status, **outcome}
             async with http_client() as client:
                 sources = RiskSources(client)
                 semaphore = asyncio.Semaphore(4)
@@ -48,11 +59,21 @@ async def run(kind="full", sites=None, trigger="manual", scheduled=False, interv
                 async def refresh(site):
                     async with semaphore:
                         try:
-                            result = (await risk.refresh_site(site, sources) if kind == "full"
-                                      else await lightning.refresh_site(site, sources))
+                            if kind == "hefs":
+                                result = await hefs.refresh_site(site, client)
+                            elif kind == "strikes":
+                                result = await strike_feed.refresh_site(site, client)
+                                result["sources"] = {"measured_lightning": {
+                                    "status": result["availability"], "error": result.get("reason"),
+                                    "retrieved_at": result.get("last_success_at")}}
+                            else:
+                                result = (await risk.refresh_site(site, sources) if kind == "full"
+                                          else await lightning.refresh_site(site, sources))
                             errors = [f"{name}: {feed.get('error', 'unavailable')}"
                                       for name, feed in result["sources"].items()
                                       if feed["status"] != "available"]
+                            if kind == 'hefs' and result['availability'] not in ('available', 'partial'):
+                                errors.append('HEFS: ' + str(result.get('reason') or result['availability']))
                             model = result.get("ml_assessment", {})
                             if (model.get("reason") == "model_request_failed_or_invalid_output"
                                     or model.get("latest_attempt", {}).get("reason") == "model_request_failed_or_invalid_output"):

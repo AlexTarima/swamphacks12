@@ -33,6 +33,7 @@ def connect():
 
 # Creates the sites table if needed. Adds demo site without overwritting
 def initialize_database():
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with connect() as connection:
         connection.execute(
             """
@@ -104,6 +105,9 @@ def initialize_database():
             kind TEXT PRIMARY KEY, last_attempt_at TEXT, last_success_at TEXT,
             last_failure_at TEXT, last_error TEXT
         )""")
+    import notifications, alerts, strike_feed, crew_reports, briefings, rivers, hefs
+    for module in (notifications, alerts, strike_feed, crew_reports, briefings, rivers, hefs):
+        module.initialize()
 
 # Retrieves all sties
 def list_sites():
@@ -159,6 +163,23 @@ def save_refreshed_risk(site_id, risk):
         connection.execute("INSERT OR REPLACE INTO risk_snapshots VALUES (?, ?, ?)",
                            (site_id, risk["generated_at"], json.dumps(risk, allow_nan=False)))
     return risk
+
+
+def save_model_output(site_id, payload):
+    import ml_risk
+    from risk_sources import utcnow
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT payload FROM risk_snapshots WHERE site_id=?", (site_id,)).fetchone()
+        if not row:
+            raise ValueError("Export an assessment before submitting model output")
+        assessment = json.loads(row["payload"])
+        incoming = ml_risk.parse_prediction(payload, ml_risk.request_for(assessment))
+        model = ml_risk.merge_predictions(assessment.get("ml_assessment"), incoming)
+        model.update(stale=False, received_at=utcnow().isoformat(), input_generated_at=assessment["generated_at"])
+        assessment["ml_assessment"] = model
+        connection.execute("UPDATE risk_snapshots SET payload=? WHERE site_id=?", (json.dumps(assessment), site_id))
+        return model
 
 
 def load_provider_cache(key, now):

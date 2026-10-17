@@ -85,6 +85,7 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
         feeds = {name: {'status': 'available', 'data': {}, 'retrieved_at': utcnow().isoformat()}
                  for name in ('weather', 'alerts', 'wildfires', 'wildlife')}
         with patch.object(RiskSources, 'for_site', new=AsyncMock(return_value=feeds)), \
+             patch('rivers.augment_assessment', side_effect=lambda site, assessment, client: assessment), \
              patch.dict(os.environ, {'PLANIT_ML_URL': ''}), \
              patch.object(risk, 'snapshot_is_fresh', return_value=False):
             first = await refresh_jobs.run('full', sites=[site])

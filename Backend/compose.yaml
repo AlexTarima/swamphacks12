@@ -1,0 +1,19 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    environment:
+      PLANIT_DATABASE_PATH: /data/sites.db
+      PLANIT_UPLOAD_DIR: /data/photos
+      PLANIT_ALLOWED_ORIGINS: ${PLANIT_ALLOWED_ORIGINS:-http://localhost:5173}
+      PLANIT_BACKGROUND_REFRESH: "1"
+      PLANIT_WRITE_TOKEN: ${PLANIT_WRITE_TOKEN:-}
+      PLANIT_LIGHTNING_API_KEY: ${PLANIT_LIGHTNING_API_KEY:-}
+      PLANIT_ML_URL: ${PLANIT_ML_URL:-}
+      PLANIT_ML_TOKEN: ${PLANIT_ML_TOKEN:-}
+    volumes:
+      - planit-data:/data
+volumes:
+  planit-data:

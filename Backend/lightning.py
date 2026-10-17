@@ -4,6 +4,8 @@ from datetime import timedelta
 
 import database
 import risk
+import alerts
+import strike_feed
 from risk_sources import parse_time, utcnow
 
 
@@ -25,6 +27,8 @@ async def refresh_site(site, sources):
         "measured_strike_feed_configured": False,
     }
     database.save_lightning(site["id"], payload)
+    alerts.evaluate({"site": site, "generated_at": now.isoformat(),
+                     "current_risk": {"indicators": {"lightning": card}}, "sources": payload["sources"]})
     return payload
 
 
@@ -32,6 +36,7 @@ def saved(site_id, max_age_seconds=90):
     payload = database.load_lightning(site_id)
     if payload is None:
         return {"site_id": site_id, "status": "pending", "stale": True,
-                "measured_strike_feed_configured": False}
-    return {**payload, "status": "ready",
+                "measured_strike_feed_configured": strike_feed.configured(), "countdown": strike_feed.state(site_id)}
+    return {**payload, "status": "ready", "countdown": strike_feed.state(site_id),
+            "measured_strike_feed_configured": strike_feed.configured(),
             "stale": utcnow() - parse_time(payload["checked_at"]) > timedelta(seconds=max_age_seconds)}

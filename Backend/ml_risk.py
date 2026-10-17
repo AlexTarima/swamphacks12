@@ -3,10 +3,13 @@
 import hashlib
 import math
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
+from copy import deepcopy
 
 import httpx
 from pydantic import AwareDatetime, BaseModel, Field
+import freshness
+from risk_sources import utcnow
 
 SCHEMA_VERSION = "site-risk-features-v1"
 FEATURE_UNITS = {
@@ -53,7 +56,8 @@ def samples_for(assessment):
                 "weather_code": indicators["lightning"]["evidence"]["weather_code"],
                 "nearest_reported_fire_km": fires[0]["distance_km"] if fires else None,
                 "wildlife_sighting_count": indicators.get("wildlife_sightings", {}).get("evidence", {}).get("total_results"),
-                "measured_lightning_strike_count": None,
+                "measured_lightning_strike_count": (
+                    assessment.get('ml_context', {}).get('measured_lightning', {}).get('count') if index == 0 else None),
             },
         })
     return samples
@@ -63,6 +67,79 @@ def unavailable(reason):
     return {"assessment_type": "trained_ml", "availability": "unavailable", "reason": reason,
             "model_id": None, "model_version": None, "score_range": [0, 10],
             "current_score": None, "current": None, "hourly_scores": [], "highest_upcoming": None}
+
+
+def serialize_predictions(snapshot, now=None):
+    """Reassess target validity on every read, even during a failed refresh.
+
+    Current predictions apply for one refresh interval after their target; hourly
+    predictions describe [target,target+1h). Neither interval implies calibration.
+    Original results remain available for audit under retained_predictions.
+    """
+    now = now or utcnow()
+    snapshot = snapshot or {}
+    source = snapshot.get('ml_assessment') or unavailable('assessment_or_model_unavailable')
+    raw = deepcopy(source.get('retained_predictions') or source)
+    raw.pop('retained_predictions', None)
+    state = freshness.assessment(snapshot, now)
+    stale_input = bool(raw.get('stale')) or state['stale']
+
+    def row_for(row, seconds, current=False):
+        if row is None:
+            return None
+        result = deepcopy(row)
+        target = freshness.timestamp(row.get('time'))
+        original = row.get('original_score', row.get('score'))
+        valid_number = isinstance(original, (int,float)) and not isinstance(original,bool) and math.isfinite(original) and 0 <= original <= 10
+        until = target + timedelta(seconds=seconds) if target else None
+        expired = target is None or now >= until or (current and now < target)
+        stale = valid_number and (stale_input or expired)
+        result.update(original_score=original, score=original if valid_number and not stale else None,
+                      availability='stale' if stale else 'available' if valid_number else 'unavailable',
+                      stale=stale, valid_until=until.isoformat() if until else None)
+        if stale:
+            result['stale_reason'] = 'input_assessment_stale' if stale_input else 'prediction_target_expired_or_invalid'
+        return result
+
+    current = row_for(raw.get('current'), freshness.refresh_seconds(), current=True)
+    hourly = [row_for(row, 3600) for row in raw.get('hourly_scores', [])]
+    valid = [row for row in hourly if row['score'] is not None]
+    known_original = has_predictions(raw)
+    current_score = current['score'] if current else None
+    any_valid = current_score is not None or bool(valid)
+    any_missing = current_score is None or any(row['score'] is None for row in hourly)
+    result = {**raw, 'current': current, 'current_score': current_score, 'hourly_scores': hourly,
+              'highest_upcoming': max(valid, key=lambda row: row['score']) if valid else None,
+              'availability': ('partial' if any_missing else 'available') if any_valid else 'stale' if known_original else 'unavailable',
+              'stale': bool(known_original and (stale_input or not any_valid)),
+              'current_availability': current['availability'] if current else 'unavailable',
+              'serialized_at': now.isoformat(), 'retained_predictions': raw,
+              'input_generated_at': raw.get('input_generated_at') or snapshot.get('generated_at')}
+    return result
+
+
+def capture_context(assessment):
+    """Snapshot supplemental data once, so export/import hashes remain stable."""
+    import crew_reports, rivers, strike_feed
+    import hefs
+    site_id = assessment['site']['id']
+    return {'schema_version': 'site-risk-context-v1', 'captured_at': utcnow().isoformat(),
+            'model_support': 'Supplemental context only; training support has not been agreed',
+            'river': rivers.saved(site_id), 'hefs': hefs.saved(site_id),
+            'crew_reports': crew_reports.active_reports(site_id),
+            'measured_lightning': strike_feed.measured_count(site_id, assessment['current_risk']['time'])}
+
+
+def probability_to_score(probability):
+    """Optional model-service conversion for the proposed likelihood contract.
+
+    Inference providers must call their equivalent before submitting score. The
+    backend never auto-detects a probability or rescales arbitrary numeric output.
+    """
+    if (isinstance(probability, bool) or not isinstance(probability, (int,float))
+            or not math.isfinite(probability) or not 0 <= probability <= 1):
+        raise ValueError('A finite probability from 0 to 1 is required')
+    return probability * 10
 
 
 def has_predictions(assessment):
@@ -98,10 +175,35 @@ def request_for(assessment):
         "site": {key: assessment["site"][key] for key in ("id", "latitude", "longitude")},
         "generated_at": assessment["generated_at"],
         "feature_units": FEATURE_UNITS, "samples": samples_for(assessment),
+        "weather_data": assessment.get("weather"), "source_availability": assessment.get("sources", {}),
+        "supplemental_context": assessment.get('ml_context', {
+            'schema_version': 'site-risk-context-v1', 'availability': 'unavailable',
+            'reason': 'This saved assessment predates context capture'}),
+        "output_contract": {'score_range': [0,10], 'target_definition_status': 'pending_teammate_agreement',
+                            'intended_interpretation': 'likelihood_scaled_by_10',
+                            'conversion_location': 'model_service_before_submission', 'probability_example': {'probability': 0.70, 'score': 7.0}},
     }
     # Reject delayed results after any input snapshot has changed.
     payload["request_id"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     return payload
+
+
+def merge_predictions(previous, incoming):
+    """Application boundary for partial outputs from the teammate's final model."""
+    if not previous or any(previous.get(key) != incoming.get(key)
+                           for key in ("request_id", "model_id", "model_version")):
+        return incoming
+    merged = {**incoming}
+    merged["current"] = incoming.get("current") or previous.get("current")
+    merged["current_score"] = merged["current"]["score"] if merged["current"] else None
+    old = {row["time"]: row for row in previous.get("hourly_scores", []) if row.get("score") is not None}
+    merged["hourly_scores"] = [old.get(row["time"], row) if row.get("score") is None else row
+                               for row in incoming["hourly_scores"]]
+    known = [row for row in merged["hourly_scores"] if row.get("score") is not None]
+    merged["highest_upcoming"] = max(known, key=lambda row: row["score"]) if known else None
+    merged["scored_samples"] = len(known) + int(merged["current"] is not None)
+    merged["availability"] = "available" if merged["scored_samples"] == merged["expected_samples"] else "partial"
+    return merged
 
 
 def parse_prediction(payload, request):
