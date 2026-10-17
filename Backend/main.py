@@ -5,6 +5,8 @@ from fastapi import Query
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 import database
+import risk
+from weather import request_params, weather_response
 
 # Start up function. Initializes the database.
 @asynccontextmanager
@@ -37,6 +39,14 @@ class SiteCreate(BaseModel):
 # defines response.
 class Site(SiteCreate):
     id: int
+    eia_plant_id: int | None = None
+    utility: str | None = None
+    county: str | None = None
+    state: str | None = None
+    plant_type: str | None = None
+    source: str | None = None
+    source_url: str | None = None
+    source_period: str | None = None
 
 # Local machine will display whats in function if web url ends in what is in quotes
 @app.get("/api/health")
@@ -72,21 +82,7 @@ def fetch_weather(latitude: float, longitude: float):
 
     # These become parameters in the request URL.
     # Specifies the location, requested measurements, and units
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "current": (
-            "temperature_2m,"
-            "relative_humidity_2m,"
-            "precipitation,"
-            "wind_speed_10m,"
-            "wind_gusts_10m"
-        ),
-        "temperature_unit": "fahrenheit",
-        "wind_speed_unit": "mph",
-        "precipitation_unit": "inch",
-        "timezone": "auto",
-    }
+    params = request_params(latitude, longitude)
 # Use parameters that were just made and call the meteo API
 # with httpx. 
     try:
@@ -98,19 +94,14 @@ def fetch_weather(latitude: float, longitude: float):
             status_code=502,
             detail="Could not retrieve weather from Open-Meteo.",
         ) from error
-    # Store data retrieved inside a json file
-    data = response.json()
-
-    return {
-        "source": "Open-Meteo",
-        "requested_coordinates": {
-            "latitude": latitude,
-            "longitude": longitude,
-        },
-        "timezone": data["timezone"],
-        "current": data["current"],
-        "units": data["current_units"],
-    }
+    try:
+        data = response.json()
+        return weather_response(data, latitude, longitude)
+    except (ValueError, KeyError, TypeError) as error:
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid weather data received from Open-Meteo.",
+        ) from error
 # First endpoint. Front end provides coordinates
 # Query makes the coordinate, and ge an le ensure valid coordinates
 @app.get("/api/weather")
@@ -136,3 +127,27 @@ def get_site_weather(site_id: int):
         "site_name": site["name"],
         "weather": weather,
     }
+
+
+@app.get("/api/sites/{site_id}/risk")
+async def get_site_risk(site_id: int):
+    return await risk.get_site_risk(get_site(site_id))
+
+
+@app.get("/api/risks")
+def get_risks():
+    """Fast portfolio view of saved assessments; pending/stale data is explicit."""
+    return risk.risk_overview(database.list_sites())
+
+
+@app.post("/api/risks/refresh")
+async def refresh_risks(
+    limit: int | None = Query(None, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Refresh all monitored sites by default; optionally request a bounded page."""
+    sites = database.list_sites()[offset:]
+    if limit is not None:
+        sites = sites[:limit]
+    results = await risk.refresh_many(sites)
+    return {"count": len(results), "risks": results}
