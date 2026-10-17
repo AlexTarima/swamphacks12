@@ -2,8 +2,18 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from fastapi import Query
+from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
+import database
 
-app = FastAPI(title="PlanIT Control Backend")
+# Start up function. Initializes the database.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    database.initialize_database()
+    yield
+
+
+app = FastAPI(title="PlanIT Control Backend", lifespan=lifespan)
 
 # Allow a locally running Vite frontend to call this backend.
 app.add_middleware(
@@ -16,15 +26,17 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-# Example data for our first version.
-sites = {
-    1: {
-        "id": 1,
-        "name": "Demo Job Site",
-        "latitude": 25.75,
-        "longitude": -80.70,
-    }
-}
+# defines and validates the input.
+# Name must contain a non-whitespace character, latitude/longitude
+# are valid
+class SiteCreate(BaseModel):
+    name: str = Field(min_length=1, pattern=r"\S")
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+
+# defines response.
+class Site(SiteCreate):
+    id: int
 
 # Local machine will display whats in function if web url ends in what is in quotes
 @app.get("/api/health")
@@ -32,20 +44,28 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/api/sites")
+@app.get("/api/sites", response_model=list[Site])
 def get_sites():
-    return list(sites.values())
+    return database.list_sites()
+
+# Third End Point. Front end will send a json with name, latitude,
+# and longitude.
+# The database assigns an ID and commits the site to disk.
+@app.post("/api/sites", response_model=Site, status_code=201)
+def create_site(site: SiteCreate):
+    return database.insert_site(**site.model_dump())
 
 # gets site_id from the url itself and then uses that in function
-@app.get("/api/sites/{site_id}")
+@app.get("/api/sites/{site_id}", response_model=Site)
 def get_site(site_id: int):
-    if site_id not in sites:
+    site = database.find_site(site_id)
+    if site is None:
         raise HTTPException(
             status_code=404,
             detail="Site not found",
         )
 
-    return sites[site_id]
+    return site
 # API for weather data
 def fetch_weather(latitude: float, longitude: float):
     url = "https://api.open-meteo.com/v1/forecast"
@@ -91,7 +111,7 @@ def fetch_weather(latitude: float, longitude: float):
         "current": data["current"],
         "units": data["current_units"],
     }
-# First endpoint
+# First endpoint. Front end provides coordinates
 # Query makes the coordinate, and ge an le ensure valid coordinates
 @app.get("/api/weather")
 def get_weather(
@@ -100,16 +120,11 @@ def get_weather(
 ):
     return fetch_weather(latitude, longitude)
 
+# Second End point. Front End provides a saved sites ID
 
 @app.get("/api/sites/{site_id}/weather")
 def get_site_weather(site_id: int):
-    if site_id not in sites:
-        raise HTTPException(
-            status_code=404,
-            detail="Site not found",
-        )
-
-    site = sites[site_id]
+    site = get_site(site_id)
 
     weather = fetch_weather(
         latitude=site["latitude"],
