@@ -1,3 +1,69 @@
+# Automatic background updates
+
+Start the backend with `.\.venv\Scripts\python.exe -m uvicorn main:app`.
+It now runs recurring refresh jobs while the backend is running, even with no
+dashboard or browser open. Keep the backend process running; closing the dashboard
+does not stop updates, but stopping the backend does.
+
+- **Full risk refresh:** every 300 seconds after the previous run finishes.
+- **Independent lightning monitor:** every 30 seconds after its previous run finishes.
+- Both jobs start when due on backend startup and read all saved sites on each run,
+  including newly created custom sites. A new site enters the next cycle automatically.
+- SQLite leases and heartbeats prevent duplicate runs across workers, the manual
+  refresh endpoint, and the CLI. Per-site leases also coordinate on-demand requests.
+  A crashed worker's lease expires after 60 seconds. Clean shutdown cancels work
+  and releases its locks. A duplicate manual full refresh returns HTTP 409.
+
+The fast monitor requests only current thunderstorm model conditions and NWS
+alerts, using its own client, cache keys, and locks. It never waits for wildfire,
+wildlife, ML inference, or the full refresh job. It **does not supply measured
+lightning strikes**: those remain explicitly unknown. Thunderstorm forecasts and
+NWS alerts cannot support a strike-distance stop-work/all-clear countdown.
+The monitor caches NWS results for 30 seconds and model conditions for 5 minutes.
+Polling faster does not turn those modeled conditions into strike observations.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/refresh/status` | Job configuration, recent runs/failures, active leases, last successful jobs, and per-site success/failure times |
+| `GET /api/sites/{site_id}/lightning` | Read the independently updated lightning monitor without triggering a full refresh |
+| `GET /api/risks` | Portfolio with source timestamps and each site's latest `lightning_monitor` |
+| `GET /api/sites/{site_id}/risk` | Full assessment plus the independent `lightning_monitor` |
+| `POST /api/risks/refresh` | Manual full refresh of all monitored sites; optional `limit` and `offset` select a page |
+
+`generated_at` (assessment) and `checked_at` (lightning monitor) describe processing
+times. Source `retrieved_at`, `expires_at`, and `cache_hit` remain visible; cache hits
+preserve the original retrieval time. Weather observation timestamps remain in
+the weather payload and monitor. A new assessment **does not mean new source data**.
+The independent monitor's timestamp can be newer than the full assessment's
+lightning card; consume `lightning_monitor` for the latest check.
+
+Job/site `last_success_at` means the configured feed-processing check succeeded,
+including valid cached responses. It does not claim that source observations are
+new or that measured strike coverage exists. Partial provider failures and exceptions
+are recorded without aborting other sites. Last-success timestamps survive later
+failures; the latest 1,000 job runs are retained. Last-success/failure state persists
+separately in SQLite. Refresh locks and status use the same `PLANIT_DATABASE_PATH`.
+Failed, partial, or interrupted jobs retry after at most 30 seconds. Existing ML
+predictions survive a refresh without replacement results, keeping their original
+timestamps and an explicit `stale` label.
+
+Optional environment settings (set before starting the server):
+
+| Setting | Default |
+| --- | --- |
+| `PLANIT_REFRESH_SECONDS` | `300` (minimum 10) |
+| `PLANIT_LIGHTNING_SECONDS` | `30` (minimum 5) |
+| `PLANIT_BACKGROUND_REFRESH` | `1`; use `0` to disable automatic jobs for tests or maintenance |
+
+`scripts/refresh_risks.py` remains a one-shot manual command, coordinated with the
+same locks. It no longer needs a separate cron/scheduler because the backend owns
+the recurring jobs. Refresh intervals are delays after completion, so a slow run
+cannot cause another run of the same kind to overlap. The lightning monitor is
+marked stale after 90 seconds without a completed check.
+
+Run the regression tests with
+`.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`.
+
 # Database
 
 Sites are stored in SQLite. Starting the FastAPI app creates `sites.db` beside

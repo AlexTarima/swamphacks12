@@ -7,6 +7,7 @@ import math
 import database
 import ml_risk
 from risk_sources import RiskSources, distance_km, http_client, parse_time, utcnow
+from refresh_locks import lease
 
 METHOD_VERSION = "planning-screen-v2"
 ASSESSMENT_REVISION = 2
@@ -257,6 +258,12 @@ def snapshot_is_fresh(snapshot, site):
 
 
 async def refresh_site(site, sources):
+    # On-demand requests and full jobs also share a per-site lease.
+    async with lease(f"site-risk:{site['id']}", wait_seconds=120):
+        return await refresh_site_locked(site, sources)
+
+
+async def refresh_site_locked(site, sources):
     snapshot = database.load_risk(site["id"])
     if snapshot_is_fresh(snapshot, site):
         return {**snapshot, "cached": True, "stale": False}
@@ -273,18 +280,13 @@ async def get_site_risk(site):
 
 
 async def refresh_many(sites):
-    semaphore = asyncio.Semaphore(4)
-    async with http_client() as client:
-        sources = RiskSources(client)
-
-        async def refresh(site):
-            async with semaphore:
-                return await refresh_site(site, sources)
-
-        return await asyncio.gather(*(refresh(site) for site in sites))
+    import refresh_jobs
+    result = await refresh_jobs.run("full", sites=sites)
+    return result["risks"]
 
 
 def risk_overview(sites):
+    import lightning
     result = []
     for site in sites:
         snapshot = database.load_risk(site["id"])
@@ -303,5 +305,7 @@ def risk_overview(sites):
             "ml_assessment": ({key: value for key, value in snapshot.get("ml_assessment", {}).items()
                                if key != "hourly_scores"} if snapshot else None),
             "risk_url": f"/api/sites/{site['id']}/risk",
+            "lightning_monitor": lightning.saved(site["id"]),
+            "sources": snapshot.get("sources") if snapshot else None,
         })
     return {"count": len(result), "sites": result}

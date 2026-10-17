@@ -6,13 +6,23 @@ from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 import database
 import risk
+import lightning
+import refresh_jobs
+from refresh_locks import RefreshBusy
 from weather import request_params, weather_response
 
 # Start up function. Initializes the database.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.initialize_database()
-    yield
+    scheduler = refresh_jobs.RefreshScheduler()
+    app.state.refresh_scheduler = scheduler
+    if refresh_jobs.enabled():
+        scheduler.start()
+    try:
+        yield
+    finally:
+        await scheduler.stop()
 
 
 app = FastAPI(title="PlanIT Control Backend", lifespan=lifespan)
@@ -131,7 +141,22 @@ def get_site_weather(site_id: int):
 
 @app.get("/api/sites/{site_id}/risk")
 async def get_site_risk(site_id: int):
-    return await risk.get_site_risk(get_site(site_id))
+    try:
+        result = await risk.get_site_risk(get_site(site_id))
+    except RefreshBusy as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {**result, "lightning_monitor": lightning.saved(site_id)}
+
+
+@app.get("/api/sites/{site_id}/lightning")
+def get_site_lightning(site_id: int):
+    get_site(site_id)
+    return lightning.saved(site_id)
+
+
+@app.get("/api/refresh/status")
+def get_refresh_status():
+    return refresh_jobs.status()
 
 
 @app.get("/api/risks")
@@ -149,5 +174,7 @@ async def refresh_risks(
     sites = database.list_sites()[offset:]
     if limit is not None:
         sites = sites[:limit]
-    results = await risk.refresh_many(sites)
-    return {"count": len(results), "risks": results}
+    try:
+        return await refresh_jobs.run("full", sites=sites, trigger="api")
+    except RefreshBusy as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error

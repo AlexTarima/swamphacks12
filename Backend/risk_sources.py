@@ -108,18 +108,19 @@ class RiskSources:
         self.locks = {name: asyncio.Lock() for name in URLS}
         self.last_wildlife_request = 0.0
 
-    async def fetch(self, name, params, ttl, transform):
-        key = name + ":v2:" + json.dumps(params, sort_keys=True)
+    async def fetch(self, name, params, ttl, transform, cache_namespace=None):
+        key = (cache_namespace or name) + ":v2:" + json.dumps(params, sort_keys=True)
         # Cache and lock by provider. Batch requests share a client and these locks;
         # EONET's global feed is downloaded once, not once per plant.
-        async with self.locks[name]:
+        lock = self.locks.setdefault(cache_namespace or name, asyncio.Lock())
+        async with lock:
             cached = database.load_provider_cache(key, time.time())
             if cached is not None:
-                return cached
+                return {**cached, "cache_hit": True}
             if name == "wildlife":
                 await asyncio.sleep(max(0, 1.1 - (time.monotonic() - self.last_wildlife_request)))
                 self.last_wildlife_request = time.monotonic()
-            result = {"url": URLS[name], "retrieved_at": utcnow().isoformat()}
+            result = {"url": URLS[name], "retrieved_at": utcnow().isoformat(), "cache_hit": False}
             try:
                 response = await self.client.get(URLS[name], params=params)
                 response.raise_for_status()
@@ -129,9 +130,31 @@ class RiskSources:
                           else "request failed" if isinstance(error, httpx.HTTPError)
                           else "invalid provider response")
                 result.update(status="unavailable", data=None, error=reason)
-                ttl = 60
+                ttl = min(ttl, 60)
+            result["expires_at"] = (utcnow() + timedelta(seconds=ttl)).isoformat()
             database.save_provider_cache(key, time.time() + ttl, result)
             return result
+
+    async def for_lightning(self, site):
+        latitude, longitude = site["latitude"], site["longitude"]
+
+        def current_weather(data):
+            current = data["current"]
+            # Read required fields so malformed data is recorded as a failure.
+            current["weather_code"]
+            current["time"]
+            return {"current": current, "utc_offset_seconds": data["utc_offset_seconds"]}
+
+        weather, alerts = await asyncio.gather(
+            self.fetch("weather", {"latitude": latitude, "longitude": longitude,
+                                   "current": "weather_code", "timezone": "auto"}, 300, current_weather,
+                       cache_namespace=f"lightning-weather:{site['id']}"),
+            # Separate cache key: the fast monitor must not inherit the full job's
+            # five-minute alert cache. This also keeps slow-provider locks separate.
+            self.fetch("alerts", {"point": f"{latitude:.4f},{longitude:.4f}", "status": "actual"},
+                       30, parse_alerts, cache_namespace=f"lightning-alerts:{site['id']}"),
+        )
+        return {"weather": weather, "alerts": alerts}
 
     async def for_site(self, site):
         latitude, longitude = site["latitude"], site["longitude"]

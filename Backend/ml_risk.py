@@ -65,6 +65,32 @@ def unavailable(reason):
             "current_score": None, "current": None, "hourly_scores": [], "highest_upcoming": None}
 
 
+def has_predictions(assessment):
+    return bool(assessment and (
+        assessment.get("current_score") is not None
+        or any(row.get("score") is not None for row in assessment.get("hourly_scores", []))
+    ))
+
+
+def retain_on_refresh(previous_snapshot, refreshed_snapshot):
+    """Keep actual model results, with their original times, until replaced."""
+    incoming = refreshed_snapshot["ml_assessment"]
+    if has_predictions(incoming):
+        return {**incoming, "stale": False,
+                "input_generated_at": refreshed_snapshot["generated_at"]}
+    previous = (previous_snapshot or {}).get("ml_assessment")
+    if not has_predictions(previous):
+        return incoming
+    return {
+        **previous, "stale": True,
+        "stale_reason": "inputs_refreshed_without_replacement_predictions",
+        "input_generated_at": previous.get("input_generated_at") or previous_snapshot["generated_at"],
+        "latest_attempt": {"time": refreshed_snapshot["generated_at"],
+                           "availability": incoming.get("availability"),
+                           "reason": incoming.get("reason")},
+    }
+
+
 def request_for(assessment):
     import json
     payload = {

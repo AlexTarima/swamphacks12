@@ -84,6 +84,26 @@ def initialize_database():
             expires_at REAL NOT NULL,
             payload TEXT NOT NULL
         )""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS refresh_leases (
+            name TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at REAL NOT NULL
+        )""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS refresh_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, trigger TEXT NOT NULL,
+            started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL,
+            site_count INTEGER NOT NULL DEFAULT 0, failures TEXT NOT NULL DEFAULT '[]'
+        )""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS refresh_site_status (
+            kind TEXT NOT NULL, site_id INTEGER NOT NULL, last_attempt_at TEXT,
+            last_success_at TEXT, last_failure_at TEXT, last_error TEXT,
+            PRIMARY KEY (kind, site_id)
+        )""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS lightning_snapshots (
+            site_id INTEGER PRIMARY KEY, payload TEXT NOT NULL
+        )""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS refresh_job_status (
+            kind TEXT PRIMARY KEY, last_attempt_at TEXT, last_success_at TEXT,
+            last_failure_at TEXT, last_error TEXT
+        )""")
 
 # Retrieves all sties
 def list_sites():
@@ -154,3 +174,101 @@ def save_provider_cache(key, expires_at, payload):
         connection.execute("DELETE FROM provider_cache WHERE expires_at < ?", (expires_at - 86400,))
         connection.execute("INSERT OR REPLACE INTO provider_cache VALUES (?, ?, ?)",
                            (key, expires_at, json.dumps(payload, allow_nan=False)))
+
+
+def claim_lease(name, owner, now, ttl):
+    with connect() as connection:
+        cursor = connection.execute(
+            """INSERT INTO refresh_leases VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET owner=excluded.owner, expires_at=excluded.expires_at
+            WHERE refresh_leases.expires_at <= ?""", (name, owner, now + ttl, now))
+        return cursor.rowcount == 1
+
+
+def renew_lease(name, owner, now, ttl):
+    with connect() as connection:
+        return connection.execute(
+            "UPDATE refresh_leases SET expires_at=? WHERE name=? AND owner=? AND expires_at>?",
+            (now + ttl, name, owner, now)).rowcount == 1
+
+
+def release_lease(name, owner):
+    with connect() as connection:
+        connection.execute("DELETE FROM refresh_leases WHERE name=? AND owner=?", (name, owner))
+
+
+def latest_run(kind):
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM refresh_runs WHERE kind=? ORDER BY id DESC LIMIT 1", (kind,)).fetchone()
+        return dict(row) if row else None
+
+
+def start_run(kind, trigger, timestamp, site_count):
+    with connect() as connection:
+        connection.execute("""INSERT INTO refresh_job_status (kind, last_attempt_at) VALUES (?, ?)
+            ON CONFLICT(kind) DO UPDATE SET last_attempt_at=excluded.last_attempt_at""", (kind, timestamp))
+        # Called only while holding this kind's lease. A leftover running record
+        # belongs to a process that crashed and whose lease has expired.
+        connection.execute("""UPDATE refresh_runs SET status='interrupted', finished_at=?,
+            failures=? WHERE kind=? AND status='running'""",
+            (timestamp, json.dumps([{"error": "Previous worker stopped before completing the run"}]), kind))
+        cursor = connection.execute("""INSERT INTO refresh_runs
+            (kind, trigger, started_at, status, site_count) VALUES (?, ?, ?, 'running', ?)""",
+            (kind, trigger, timestamp, site_count))
+        return cursor.lastrowid
+
+
+def finish_run(run_id, timestamp, status, failures):
+    with connect() as connection:
+        row = connection.execute("SELECT kind FROM refresh_runs WHERE id=?", (run_id,)).fetchone()
+        if row:
+            if status == "succeeded":
+                connection.execute("UPDATE refresh_job_status SET last_success_at=?, last_error=NULL WHERE kind=?",
+                                   (timestamp, row["kind"]))
+            else:
+                connection.execute("UPDATE refresh_job_status SET last_failure_at=?, last_error=? WHERE kind=?",
+                                   (timestamp, json.dumps(failures), row["kind"]))
+        connection.execute("UPDATE refresh_runs SET finished_at=?, status=?, failures=? WHERE id=?",
+                           (timestamp, status, json.dumps(failures), run_id))
+        connection.execute("DELETE FROM refresh_runs WHERE id NOT IN (SELECT id FROM refresh_runs ORDER BY id DESC LIMIT 1000)")
+
+
+def record_site_refresh(kind, site_id, timestamp, error=None):
+    with connect() as connection:
+        connection.execute("""INSERT INTO refresh_site_status
+            (kind, site_id, last_attempt_at, last_success_at, last_failure_at, last_error)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(kind, site_id) DO UPDATE SET
+                last_attempt_at=excluded.last_attempt_at,
+                last_success_at=COALESCE(excluded.last_success_at, refresh_site_status.last_success_at),
+                last_failure_at=COALESCE(excluded.last_failure_at, refresh_site_status.last_failure_at),
+                last_error=excluded.last_error""",
+            (kind, site_id, timestamp, timestamp if error is None else None,
+             timestamp if error is not None else None, error))
+
+
+def refresh_status():
+    with connect() as connection:
+        runs = [dict(row) for row in connection.execute("SELECT * FROM refresh_runs ORDER BY id DESC LIMIT 20")]
+        for run in runs:
+            run["failures"] = json.loads(run["failures"])
+        return {
+            "recent_runs": runs,
+            "sites": [dict(row) for row in connection.execute("SELECT * FROM refresh_site_status ORDER BY site_id, kind")],
+            "leases": [dict(row) for row in connection.execute("SELECT name, expires_at FROM refresh_leases")],
+            "jobs": [dict(row) for row in connection.execute("SELECT * FROM refresh_job_status ORDER BY kind")],
+            "last_successful_runs": {row["kind"]: row["last_success_at"] for row in connection.execute(
+                "SELECT kind, last_success_at FROM refresh_job_status")},
+        }
+
+
+def save_lightning(site_id, payload):
+    with connect() as connection:
+        connection.execute("INSERT OR REPLACE INTO lightning_snapshots VALUES (?, ?)",
+                           (site_id, json.dumps(payload, allow_nan=False)))
+
+
+def load_lightning(site_id):
+    with connect() as connection:
+        row = connection.execute("SELECT payload FROM lightning_snapshots WHERE site_id=?", (site_id,)).fetchone()
+        return json.loads(row["payload"]) if row else None
