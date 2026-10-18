@@ -202,7 +202,8 @@ export default function App() {
     const v = version.current,
       seq = ++portfolioReq.current;
     try {
-      const data = await request("/api/risks");
+      // Render may need extra time to wake a sleeping instance on the first request.
+      const data = await request("/api/risks", { timeout: 60000 });
       if (v !== version.current || seq !== portfolioReq.current) return;
       setLiveRows(data.sites || []);
       setSelected((currentSelected) =>
