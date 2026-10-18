@@ -1,7 +1,11 @@
-let base = "";
+export const API_URL = (
+  import.meta.env.VITE_API_URL ||
+  (import.meta.env.DEV ? "" : "https://swamphacks-xii.onrender.com")
+).trim().replace(/\/$/, "");
+let base = API_URL;
 let token = "";
 export function configureApi(url, writeToken = "") {
-  base = url.trim().replace(/\/$/, "");
+  base = (url.trim() || API_URL).replace(/\/$/, "");
   token = writeToken;
 }
 export function apiUrl(path) {

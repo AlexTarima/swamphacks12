@@ -23,6 +23,8 @@ The app opens in **Demo data** mode with an illustrative Florida workday. You ca
 
 Start your existing Python backend on **port 8000** using its existing deployment instructions. Then select **Connect your backend** in the dashboard and leave **Backend URL** blank. The Vite development proxy forwards `/api` to `http://127.0.0.1:8000`.
 
+For a production build, set `VITE_API_URL=https://swamphacks-xii.onrender.com` in the hosting provider's environment variables. The deployed build uses that Render backend URL for all API requests; local development continues to use the Vite proxy when no URL is configured.
+
 If your backend has `PLANIT_WRITE_TOKEN` configured, enter that value in the optional **Write token** field. The token stays in this tab's memory and is sent with write requests. It is not saved in local storage. Provider keys such as Xweather or Weather Company credentials stay in the backend's `.env`; this frontend does not need those keys.
 
 Once connected, the app replaces all sample sites and conditions with API responses. Live site/report changes are saved by your backend. Reopening the page starts in demo mode, so connect again when you want live data.
