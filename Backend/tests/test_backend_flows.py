@@ -46,6 +46,8 @@ class BackendFlows(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
+        # These tests drive their own deterministic refresh after creating a site.
+        self.enterContext(patch('main.initial_assessments.queue'))
         self.enterContext(patch.object(database, 'DATABASE_PATH', Path(temp.name) / 'sites.db'))
         self.enterContext(patch.dict(os.environ, {'PLANIT_ML_URL': '', 'PLANIT_LIGHTNING_API_KEY': '',
                                                 'PLANIT_BACKGROUND_REFRESH': '0', 'PLANIT_WRITE_TOKEN': '',

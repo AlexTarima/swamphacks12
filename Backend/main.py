@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
+import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from fastapi import Query
@@ -11,6 +12,7 @@ import database
 import risk
 import lightning
 import refresh_jobs
+import initial_assessments
 import alerts
 import notifications
 import crew_reports
@@ -22,6 +24,7 @@ import ml_risk
 import site_responses
 from refresh_locks import RefreshBusy
 from weather import request_params, weather_response
+from risk_sources import utcnow
 
 # Start up function. Initializes the database.
 @asynccontextmanager
@@ -31,9 +34,16 @@ async def lifespan(app: FastAPI):
     app.state.refresh_scheduler = scheduler
     if refresh_jobs.enabled():
         scheduler.start()
+        retry_task = initial_assessments.queue_retries()
+    else:
+        retry_task = None
     try:
         yield
     finally:
+        if retry_task:
+            retry_task.cancel()
+            await asyncio.gather(retry_task, return_exceptions=True)
+        await initial_assessments.stop()
         await scheduler.stop()
 
 
@@ -90,6 +100,7 @@ class Site(SiteCreate):
     source: str | None = None
     source_url: str | None = None
     source_period: str | None = None
+    initial_assessment: dict | None = None
 
 # Local machine will display whats in function if web url ends in what is in quotes
 @app.get("/api/health")
@@ -99,17 +110,20 @@ def health():
 
 @app.get("/api/sites", response_model=list[Site])
 def get_sites():
-    return [{**site, "timezone": briefings.get_timezone(site["id"])} for site in database.list_sites()]
+    return [{**site, "timezone": briefings.get_timezone(site["id"]),
+             "initial_assessment": database.initial_assessment(site['id'])} for site in database.list_sites()]
 
 # Third End Point. Front end will send a json with name, latitude,
 # and longitude.
 # The database assigns an ID and commits the site to disk.
 @app.post("/api/sites", response_model=Site, status_code=201)
-def create_site(site: SiteCreate):
+async def create_site(site: SiteCreate):
     result = database.insert_site(**site.model_dump(exclude={"timezone"}))
     if site.timezone:
         briefings.set_timezone(result["id"], site.timezone)
-    return {**result, "timezone": site.timezone}
+    initial_assessments.queue(result['id'])
+    return {**result, "timezone": site.timezone,
+            "initial_assessment": database.initial_assessment(result['id'])}
 
 # gets site_id from the url itself and then uses that in function
 def get_site(site_id: int):
@@ -125,7 +139,8 @@ def get_site(site_id: int):
 
 @app.get("/api/sites/{site_id}", response_model=Site)
 def get_site_record(site_id: int):
-    return {**get_site(site_id), "timezone": briefings.get_timezone(site_id)}
+    return {**get_site(site_id), "timezone": briefings.get_timezone(site_id),
+            "initial_assessment": database.initial_assessment(site_id)}
 # API for weather data
 def fetch_weather(latitude: float, longitude: float):
     url = "https://api.open-meteo.com/v1/forecast"
@@ -192,6 +207,15 @@ async def get_site_risk(site_id: int):
 def get_site_detail(site_id: int):
     """Saved combined view; never waits for a provider or for the optional model."""
     return site_responses.detail(get_site(site_id))
+
+
+@app.post('/api/sites/{site_id}/assessment/retry')
+async def retry_initial_assessment(site_id: int):
+    get_site(site_id)
+    if not database.retry_initial_assessment(site_id, utcnow().isoformat()):
+        raise HTTPException(409, 'Only a failed initial assessment can be retried')
+    initial_assessments.queue(site_id)
+    return database.initial_assessment(site_id)
 
 
 @app.get("/api/sites/{site_id}/ml-input")

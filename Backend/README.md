@@ -262,3 +262,7 @@ Historical crew reports can be discovered across sites using
 `GET /api/reports/nearby` with bounded coordinates, radius and limit.
 
 Run checks with `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`.
+# METAR warning-model integration
+
+See [METAR_MODEL_HANDOFF.md](METAR_MODEL_HANDOFF.md) for the IEM observation contract,
+the six-hour NWS warning target, frozen local model, limitations, and Ubuntu/WSL startup.

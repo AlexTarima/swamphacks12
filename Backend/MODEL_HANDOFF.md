@@ -247,3 +247,8 @@ Regression checks:
 ```powershell
 .\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
 ```
+# Separate METAR warning model
+
+The experimental six-hour NWS Severe Thunderstorm Warning integration is documented
+in [METAR_MODEL_HANDOFF.md](METAR_MODEL_HANDOFF.md). It uses `weather_model`, separate
+from this generic 0–10 ML contract and its hourly scores.

@@ -3,15 +3,17 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 import math
+import os
 
 import database
 import ml_risk
+import metar_model
 import freshness
 from risk_sources import RiskSources, distance_km, http_client, parse_time, utcnow
 from refresh_locks import lease
 
 METHOD_VERSION = "planning-screen-v2"
-ASSESSMENT_REVISION = 5
+ASSESSMENT_REVISION = 8
 LEVELS = {"unknown": -1, "info": -1, "low": 0, "watch": 1, "high": 2, "severe": 3}
 ALERT_TERMS = {
     "weather": ("wind", "tornado", "hurricane", "tropical", "storm", "snow", "blizzard", "ice"),
@@ -253,18 +255,26 @@ def snapshot_is_fresh(snapshot, site):
     return (snapshot is not None and snapshot.get("method_version") == METHOD_VERSION
             and snapshot.get("assessment_revision") == ASSESSMENT_REVISION
             and snapshot.get("ml_configuration_id") == ml_risk.configuration_id()
+            and snapshot.get("metar_ml_configuration_id", metar_model.configuration_id()) == metar_model.configuration_id()
             and snapshot.get("site") == site
             and not freshness.assessment(snapshot, now=utcnow())['stale'])
 
 
 async def refresh_site(site, sources):
     # On-demand requests and full jobs also share a per-site lease.
+    before = database.load_risk(site['id'])
     async with lease(f"site-risk:{site['id']}", wait_seconds=120):
+        latest = database.load_risk(site['id'])
+        if latest and latest.get('generated_at') != (before or {}).get('generated_at'):
+            # A concurrent initial/manual/scheduled worker already refreshed this
+            # site while we waited. Partial coverage can be retry-due immediately,
+            # but it must not cause the same wave of requests to run twice.
+            return {**latest, 'cached': True, 'stale': not snapshot_is_fresh(latest, site)}
         return await refresh_site_locked(site, sources)
 
 
 async def refresh_site_locked(site, sources):
-    import alerts, briefings, rivers
+    import alerts, briefings, rivers, metar, metar_model
     snapshot = database.load_risk(site["id"])
     if snapshot_is_fresh(snapshot, site) and not freshness.assessment(snapshot, now=utcnow())['refresh_due']:
         alerts.evaluate(snapshot, include_lightning=False)
@@ -282,6 +292,11 @@ async def refresh_site_locked(site, sources):
     result['ml_context'] = ml_risk.capture_context(result)
     result["ml_assessment"] = await ml_risk.predict(result)
     result["ml_configuration_id"] = ml_risk.configuration_id()
+    result['metar'] = (await metar.assess(site, sources.client, now=parse_time(result['generated_at']))
+                       if os.environ.get('PLANIT_METAR_ENABLED', '1').lower() not in ('0', 'false', 'no')
+                       else {"availability": "unavailable", "reason": "metar_disabled", "station": database.metar_station(site)})
+    result['weather_model'] = await metar_model.predict(result, result['metar'])
+    result['metar_ml_configuration_id'] = metar_model.configuration_id()
     result = database.save_refreshed_risk(site["id"], result)
     return {**result, "cached": False, "stale": False}
 

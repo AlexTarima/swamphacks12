@@ -1,6 +1,7 @@
 """SQLite storage for construction sites."""
 
 from contextlib import contextmanager
+from datetime import timedelta
 import os
 from pathlib import Path
 import sqlite3
@@ -85,6 +86,12 @@ def initialize_database():
             expires_at REAL NOT NULL,
             payload TEXT NOT NULL
         )""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS metar_station_selection (
+            site_id INTEGER PRIMARY KEY, latitude REAL NOT NULL, longitude REAL NOT NULL,
+            station_id TEXT NOT NULL, station_latitude REAL NOT NULL,
+            station_longitude REAL NOT NULL, distance_km REAL NOT NULL,
+            provenance TEXT NOT NULL, selected_at TEXT NOT NULL
+        )""")
         connection.execute("""CREATE TABLE IF NOT EXISTS refresh_leases (
             name TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at REAL NOT NULL
         )""")
@@ -97,6 +104,11 @@ def initialize_database():
             kind TEXT NOT NULL, site_id INTEGER NOT NULL, last_attempt_at TEXT,
             last_success_at TEXT, last_failure_at TEXT, last_error TEXT,
             PRIMARY KEY (kind, site_id)
+        )""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS initial_assessments (
+            site_id INTEGER PRIMARY KEY, status TEXT NOT NULL, queued_at TEXT NOT NULL,
+            started_at TEXT, finished_at TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+            next_retry_at TEXT, error TEXT, source_failures TEXT NOT NULL DEFAULT '[]'
         )""")
         connection.execute("""CREATE TABLE IF NOT EXISTS lightning_snapshots (
             site_id INTEGER PRIMARY KEY, payload TEXT NOT NULL
@@ -133,7 +145,56 @@ def insert_site(name: str, latitude: float, longitude: float):
         row = connection.execute(
             "SELECT * FROM sites WHERE id = ?", (cursor.lastrowid,)
         ).fetchone()
+        from risk_sources import utcnow
+        connection.execute("INSERT INTO initial_assessments (site_id, status, queued_at) VALUES (?, 'pending', ?)",
+                           (row['id'], utcnow().isoformat()))
         return dict(row)
+
+
+def initial_assessment(site_id):
+    with connect() as connection:
+        row = connection.execute('SELECT * FROM initial_assessments WHERE site_id=?', (site_id,)).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result['source_failures'] = json.loads(result['source_failures'])
+    return result
+
+
+def due_initial_assessments(now):
+    from risk_sources import parse_time
+    abandoned_before = (parse_time(now) - timedelta(minutes=3)).isoformat()
+    with connect() as connection:
+        return [row['site_id'] for row in connection.execute("""SELECT site_id FROM initial_assessments
+            WHERE status='pending' OR (status='failed' AND next_retry_at<=?)
+                OR (status='running' AND started_at<=?) ORDER BY queued_at LIMIT 20""",
+            (now, abandoned_before))]
+
+
+def claim_initial_assessment(site_id, now):
+    from risk_sources import parse_time
+    abandoned_before = (parse_time(now) - timedelta(minutes=3)).isoformat()
+    with connect() as connection:
+        cursor = connection.execute("""UPDATE initial_assessments SET status='running', started_at=?,
+            finished_at=NULL, attempts=attempts+1, error=NULL, next_retry_at=NULL
+            WHERE site_id=? AND (status='pending' OR (status='failed' AND next_retry_at<=?)
+                OR (status='running' AND started_at<=?))""",
+            (now, site_id, now, abandoned_before))
+        return cursor.rowcount == 1
+
+
+def finish_initial_assessment(site_id, started_at, now, status, error=None, source_failures=None, next_retry_at=None):
+    with connect() as connection:
+        connection.execute("""UPDATE initial_assessments SET status=?, finished_at=?, error=?,
+            source_failures=?, next_retry_at=? WHERE site_id=? AND status='running' AND started_at=?""",
+            (status, now, error, json.dumps(source_failures or []), next_retry_at, site_id, started_at))
+
+
+def retry_initial_assessment(site_id, now):
+    with connect() as connection:
+        return connection.execute("""UPDATE initial_assessments SET status='pending', queued_at=?,
+            started_at=NULL, finished_at=NULL, next_retry_at=NULL, error=NULL
+            WHERE site_id=? AND status='failed'""", (now, site_id)).rowcount == 1
 
 
 def save_risk(site_id, risk):
@@ -195,6 +256,22 @@ def save_provider_cache(key, expires_at, payload):
         connection.execute("DELETE FROM provider_cache WHERE expires_at < ?", (expires_at - 86400,))
         connection.execute("INSERT OR REPLACE INTO provider_cache VALUES (?, ?, ?)",
                            (key, expires_at, json.dumps(payload, allow_nan=False)))
+
+
+def metar_station(site):
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM metar_station_selection WHERE site_id=?", (site['id'],)).fetchone()
+        if row and (row['latitude'], row['longitude']) == (site['latitude'], site['longitude']):
+            return dict(row)
+        return None
+
+
+def save_metar_station(site, station):
+    with connect() as connection:
+        connection.execute("""INSERT OR REPLACE INTO metar_station_selection VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?)""", (site['id'], site['latitude'], site['longitude'],
+            station['station_id'], station['station_latitude'], station['station_longitude'],
+            station['distance_km'], station['provenance'], station['selected_at']))
 
 
 def claim_lease(name, owner, now, ttl):

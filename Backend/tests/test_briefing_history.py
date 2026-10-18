@@ -26,6 +26,7 @@ class BriefingAndHistory(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
+        self.enterContext(patch('main.initial_assessments.queue'))
         self.enterContext(patch.object(database, "DATABASE_PATH", Path(temp.name) / "isolated.sqlite"))
         self.enterContext(patch.dict(os.environ, {
             "PLANIT_BACKGROUND_REFRESH": "0", "PLANIT_ML_URL": "", "PLANIT_WRITE_TOKEN": "",

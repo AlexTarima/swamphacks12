@@ -33,6 +33,40 @@ objects; tomorrow's forecast does not become today's condition.
 `GET /api/sites/{id}/risk` preserves the existing refresh-on-demand behavior and
 returns the same combined fields plus legacy risk fields.
 
+`POST /api/sites` now returns promptly after saving, including `initial_assessment`
+with `status: pending`. A separate worker starts the assessment immediately. The
+same object appears in `/api/risks` rows and `/api/sites/{id}/detail` with
+`pending`, `running`, `completed`, or `failed`, plus `queued_at`, `started_at`,
+`finished_at`, `attempts`, `next_retry_at`, `error`, and `source_failures`.
+`completed` means an assessment was saved; check `source_failures` and `sources`
+for partial coverage. Failed attempts retry automatically with bounded backoff
+when background refresh is enabled. `POST /api/sites/{id}/assessment/retry`
+immediately requeues a failed attempt. The connected frontend polls `/api/risks`
+and selected detail every three seconds while any initial assessment is pending
+or running, then resumes its usual cadence. Display “Assessing…” during that time.
+
+The separate `weather_model` object is the experimental probability of a **new
+NWS Severe Thunderstorm Warning covering the site within six hours**. Show
+`probability` as a percent only when `availability=available`; label it
+experimental and state that calibration is not established. Show `model_version`,
+`prediction_time`, `outcome_start`, `outcome_end`, `current_observed_at`,
+`prior_observed_at`, `station`, `input_availability`, and `input_reason`. Check
+the parallel `metar` object even when a scored result exists: stale observations
+remain visible. `availability=stale` with `reason=prediction_expired` has null
+display probability. Distinguish pending, missing METAR input, unavailable model,
+and expired output. `weather_model.score` is 10 × this probability and is **not**
+`current_score`, a site hazard index, or a ranking input. Stop-work and lightning
+clearance remain rule based. The connected frontend implements this contract.
+
+Example creation response (times and ID illustrative):
+
+```json
+{"id": 62, "name": "North site", "latitude": 30.0, "longitude": -81.0,
+ "initial_assessment": {"site_id": 62, "status": "pending", "queued_at": "2026-10-17T12:00:00+00:00",
+ "started_at": null, "finished_at": null, "attempts": 0, "next_retry_at": null,
+ "error": null, "source_failures": []}}
+```
+
 | Field | Meaning |
 | --- | --- |
 | rule_based_assessment | Current levels/evidence, hourly rules, highest upcoming rules |

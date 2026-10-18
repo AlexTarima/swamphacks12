@@ -5,6 +5,7 @@ import crew_reports
 import database
 import lightning
 import ml_risk
+import metar_model
 import risk
 import strike_feed
 import freshness
@@ -25,14 +26,18 @@ def detail(site, snapshot=None):
     import hefs
     snapshot = snapshot if snapshot is not None else database.load_risk(site["id"])
     model = model_for(snapshot)
+    initial = database.initial_assessment(site['id'])
     return {
         **(snapshot or {}), "site": site, "status": "ready" if snapshot else "pending",
+        "initial_assessment": initial,
         "rule_based_assessment": {"assessment_type": "rule_based", "current": (snapshot or {}).get("current_risk"),
                                   "hourly": (snapshot or {}).get("hourly_predicted_risk", []),
                                   "highest_upcoming": (snapshot or {}).get("highest_upcoming_risk")},
         "conditions": (snapshot or {}).get("weather"),
         "hazard_evidence": (snapshot or {}).get("indicators", {}),
         "ml_predictions": model, "ml_assessment": model,
+        "metar": (snapshot or {}).get('metar', {"availability": "pending", "reason": "assessment_pending"}),
+        "weather_model": metar_model.serialize((snapshot or {}).get('weather_model')),
         "required_safety_actions": alerts.required_actions(site["id"]),
         "alerts": alerts.for_site(site["id"]), "active_crew_reports": crew_reports.active_reports(site["id"]),
         "timezone": briefings.timezone_status(site["id"]),
@@ -48,6 +53,7 @@ def overview(sites):
     import hefs
     rows = []
     for site in sites:
+        initial = database.initial_assessment(site['id'])
         snapshot = database.load_risk(site["id"])
         if snapshot and (snapshot.get("method_version") != risk.METHOD_VERSION
                          or snapshot.get("assessment_revision") != risk.ASSESSMENT_REVISION):
@@ -69,11 +75,14 @@ def overview(sites):
         rows.append({
             "site": site, "site_id": site["id"], "latitude": site["latitude"], "longitude": site["longitude"],
             "status": "ready" if snapshot else "pending", "current_score": None if unavailable else model.get("current_score"),
+            "initial_assessment": initial,
             "ml_availability": "stale" if model.get("stale") else model.get("availability", "unavailable"),
             "upcoming_peak": {"rule_based": peak, "ml_prediction": None if unavailable else model.get("highest_upcoming")},
             "current_risk": current, "overall": current,
             "highest_upcoming_risk": ({"time": peak["time"], **peak["overall"]} if peak else None),
             "ml_assessment": {k: v for k, v in model.items() if k != "hourly_scores"},
+            "metar": (snapshot or {}).get('metar', {"availability": "pending", "reason": "assessment_pending"}),
+            "weather_model": metar_model.serialize((snapshot or {}).get('weather_model')),
             "active_alert_status": {"count": len(site_alerts), "stop_work": any(a["stop_work"] for a in site_alerts),
                                     "highest_severity": alert_level},
             "rule_based_severity": level, "ranking_basis": "rule_based",

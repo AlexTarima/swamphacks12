@@ -1,6 +1,6 @@
 # Local WSL startup
 
-Use Python 3.11 or newer. Windows and WSL need separate virtual environments.
+Use Python 3.14 for the verified frozen-model environment. Windows and WSL need separate virtual environments.
 From this Backend directory in Ubuntu/WSL:
 
 ```bash
@@ -228,3 +228,26 @@ The verification route and recurring strike job share a per-site lease.
 NOAA river discovery uses a 10 km search and [the NWPS API](https://api.water.noaa.gov/nwps/v1/docs/).
 Nearby-gauge proximity is labeled separately from supervisor-confirmed river
 exposure; it does not prove hydraulic connectivity or floodplain membership.
+
+# METAR model service
+
+The supplied geographic frozen model is loaded locally by default. Keep
+`PlanIT-ML/` next to `Backend/` for Ubuntu/WSL source startup. The Compose file
+mounts its geographic artifact read-only into the container. Other container
+deployments must mount the same artifact and set `PLANIT_METAR_ML_ARTIFACT` to
+its in-container path. The optional remote model boundary uses
+`PLANIT_METAR_ML_URL`, `PLANIT_METAR_ML_TOKEN`, and
+`PLANIT_METAR_ML_MODEL_VERSION` in `.env`. See
+[METAR_MODEL_HANDOFF.md](METAR_MODEL_HANDOFF.md) for the frozen-model service
+request and response and the Ubuntu/WSL setup steps.
+
+# Initial site assessments
+
+With `PLANIT_BACKGROUND_REFRESH=1` (the default), a newly saved site is assessed
+immediately in a separate task and failed initial attempts are retried after 30,
+60, 120 seconds and so on, capped at 15 minutes. The initial status is persisted
+in SQLite, so a worker restart can resume pending or due failed work. Full-site
+periodic refresh continues independently. With background refresh disabled,
+new sites still queue an immediate assessment and failed attempts can be retried
+through `POST /api/sites/{id}/assessment/retry`; automatic retries require the
+background worker. The frontend polls while initialization is pending.
