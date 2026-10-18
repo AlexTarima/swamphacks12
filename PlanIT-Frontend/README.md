@@ -21,7 +21,7 @@ The app opens in **Demo data** mode with an illustrative Florida workday. You ca
 
 ## Connect your backend
 
-Start your existing Python backend on **port 8000** using its existing deployment instructions. Then select **Connect your backend** in the dashboard and leave **Backend URL** blank. The Vite development proxy forwards `/api` to `http://127.0.0.1:8000`.
+Start your existing Python backend on **port 8000** using its existing deployment instructions. Local development uses the Vite proxy, which forwards `/api` to `http://127.0.0.1:8000`. Production builds connect automatically to the configured API URL.
 
 For a production build, set `VITE_API_URL=https://swamphacks-xii.onrender.com` in the hosting provider's environment variables. The deployed build uses that Render backend URL for all API requests; local development continues to use the Vite proxy when no URL is configured.
 

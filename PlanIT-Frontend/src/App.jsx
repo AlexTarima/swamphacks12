@@ -107,7 +107,7 @@ function SiteSearchSelect({ rows, selected, onChange }) {
 }
 export default function App() {
   const [demo, setDemo] = useState(seedDemo),
-    [mode, setMode] = useState("demo"),
+    [mode, setMode] = useState(API_URL ? "live" : "demo"),
     [liveRows, setLiveRows] = useState([]),
     [liveDetail, setLiveDetail] = useState(null),
     [selected, setSelected] = useState(1),
@@ -124,8 +124,7 @@ export default function App() {
     [connected, setConnected] = useState(false),
     [lastSync, setLastSync] = useState(null),
     [stream, setStream] = useState("idle");
-  const [baseUrl, setBaseUrl] = useState(readSetting("planit:base", API_URL)),
-    [token, setToken] = useState(""),
+  const [baseUrl] = useState(API_URL),
     [now, setNow] = useState(Date.now()),
     [showStops, setShowStops] = useState(false),
     [showNeeds, setShowNeeds] = useState(false),
@@ -197,8 +196,8 @@ export default function App() {
     };
   }, []);
   useEffect(() => {
-    configureApi(baseUrl, token);
-  }, [baseUrl, token]);
+    configureApi(baseUrl);
+  }, [baseUrl]);
   const loadPortfolio = useCallback(async () => {
     const v = version.current,
       seq = ++portfolioReq.current;
@@ -206,6 +205,9 @@ export default function App() {
       const data = await request("/api/risks");
       if (v !== version.current || seq !== portfolioReq.current) return;
       setLiveRows(data.sites || []);
+      setSelected((currentSelected) =>
+        data.sites[0]?.site_id ?? data.sites[0]?.site?.id ?? currentSelected,
+      );
       setConnected(true);
       setLastSync(Date.now());
       setError("");
@@ -354,54 +356,9 @@ export default function App() {
     setModal(null);
     notify("Demo workspace opened. All data here is illustrative.");
   }
-  async function connect(e) {
-    e.preventDefault();
-    setBusy(true);
-    setError("");
-    const form = new FormData(e.currentTarget),
-      url = String(form.get("base") || "")
-        .trim()
-        .replace(/\/$/, "");
-    const secret = String(form.get("token") || "");
-    try {
-      if (location.protocol === "file:" && !url)
-        throw new Error(
-          "This standalone preview has no API proxy. Run the included project with npm run dev, or enter a reachable backend URL.",
-        );
-      if (url && !/^https?:\/\//.test(url))
-        throw new Error(
-          "Use a full http:// or https:// address, or leave it blank for the local proxy.",
-        );
-      configureApi(url, secret);
-      await request("/api/health", { timeout: 8000 });
-      const result = await request("/api/risks");
-      if (!Array.isArray(result.sites))
-        throw new Error("This address did not return the PlanIT API contract.");
-      version.current++;
-      setBaseUrl(url);
-      remember("planit:base", url);
-      setToken(secret);
-      setLiveRows(result.sites);
-      setSelected(
-        result.sites[0]?.site_id ?? result.sites[0]?.site?.id ?? null,
-      );
-      setLiveDetail(null);
-      setMode("live");
-      setConnected(true);
-      setLastSync(Date.now());
-      setModal(null);
-      setPage("overview");
-      notify("Connected to your backend. Showing saved site data.");
-    } catch (e) {
-      setError(e.message);
-      configureApi(baseUrl, token);
-    } finally {
-      setBusy(false);
-    }
-  }
   async function refresh() {
     if (mode === "demo") {
-      notify("Demo scenario is ready. Connect your backend for live updates.");
+      notify("Demo scenario is ready. Configure VITE_API_URL for live updates.");
       return;
     }
     setRefreshing(true);
@@ -678,10 +635,7 @@ export default function App() {
           </span>
         </a>
         <div className="workspace-label">YOUR WORKSPACE</div>
-        <button
-          className="workspace-switch"
-          onClick={() => openModal("connect")}
-        >
+        <div className="workspace-switch">
           <span className="workspace-icon">
             <Icon name="HardHat" size={19} />
           </span>
@@ -692,7 +646,7 @@ export default function App() {
             </small>
           </span>
           <Icon name="ChevronsUpDown" size={14} />
-        </button>
+        </div>
         <nav aria-label="Main navigation">
           {NAV.map(([id, icon, label]) => (
             <button
@@ -720,9 +674,6 @@ export default function App() {
               BUILT FOR THE FIELD <Icon name="ArrowUpRight" size={13} />
             </span>
           </div>
-          <button className="settings-nav" onClick={() => openModal("connect")}>
-            <Icon name="SlidersHorizontal" size={17} /> Connection settings
-          </button>
           <div className="profile">
             <span className="avatar">K</span>
             <div>
@@ -870,33 +821,24 @@ export default function App() {
                   All site conditions and observations are demo data.
                 </strong>
               </span>
-              <button onClick={() => openModal("connect")}>
-                Connect your backend <Icon name="ArrowRight" size={14} />
-              </button>
             </div>
           )}
           {mode === "live" && error && !modal && (
             <div className="error-banner" role="alert">
               <Icon name="WifiOff" size={18} />
               <span>{error} Previously loaded values may be stale.</span>
-              <button onClick={() => openModal("connect")}>Settings</button>
+              <button onClick={refresh}>Retry connection</button>
             </div>
           )}
           {mode === "live" && !rows.length ? (
             <Empty icon="MapPinned" title="Your workspace is ready">
-              Add your first jobsite, or check your backend connection.
+              Add your first jobsite. The backend connection will retry automatically.
               <div className="empty-actions">
                 <button
                   className="button primary"
                   onClick={() => openModal("add-site")}
                 >
                   Add a site
-                </button>
-                <button
-                  className="button secondary"
-                  onClick={() => openModal("connect")}
-                >
-                  Connection settings
                 </button>
               </div>
             </Empty>
@@ -1804,9 +1746,7 @@ export default function App() {
       {modal && (
         <Modal
           title={
-            modal === "connect"
-              ? "Connect your workspace"
-              : modal === "add-site"
+            modal === "add-site"
                 ? "Add a jobsite"
                 : modal === "report"
                   ? "Share a field observation"
@@ -1819,9 +1759,7 @@ export default function App() {
                         : modal.title || "Details"
           }
           subtitle={
-            modal === "connect"
-              ? "Use your local PlanIT backend, or explore the demo."
-              : modal === "report"
+            modal === "report"
                 ? site?.name
                 : null
           }
@@ -1835,62 +1773,6 @@ export default function App() {
             <div className="form-error" role="alert">
               {error}
             </div>
-          )}
-          {modal === "connect" && (
-            <form onSubmit={connect}>
-              <div className="connection-explainer">
-                <Icon name="Laptop" size={22} />
-                <div>
-                  <strong>Your backend, your data.</strong>
-                  <p>
-                    Run this frontend on port 5173 and your Python backend on
-                    port 8000. The local proxy handles the connection.
-                  </p>
-                </div>
-              </div>
-              <label className="field">
-                Backend URL{" "}
-                <span>Leave blank for the included local proxy</span>
-                <input
-                  name="base"
-                  placeholder="Local proxy → localhost:8000"
-                  defaultValue={baseUrl}
-                  autoComplete="url"
-                />
-              </label>
-              <label className="field">
-                Write token{" "}
-                <span>Only if PLANIT_WRITE_TOKEN is set on your backend</span>
-                <input
-                  type="password"
-                  name="token"
-                  defaultValue={token}
-                  placeholder="Optional"
-                  autoComplete="off"
-                />
-              </label>
-              <p className="form-hint">
-                Weather-provider keys stay in your Python backend. The write
-                token stays in this browser tab’s memory.
-              </p>
-              <div className="modal-actions">
-                <button
-                  type="button"
-                  className="button secondary"
-                  onClick={backToDemo}
-                >
-                  Explore demo
-                </button>
-                <button className="button primary" disabled={busy}>
-                  {busy ? (
-                    <Icon name="LoaderCircle" className="spin" size={16} />
-                  ) : (
-                    <Icon name="PlugZap" size={16} />
-                  )}{" "}
-                  {busy ? "Connecting…" : "Connect backend"}
-                </button>
-              </div>
-            </form>
           )}
           {modal === "add-site" && (
             <form onSubmit={addSite}>
